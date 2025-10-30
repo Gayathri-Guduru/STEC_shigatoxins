@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""
+STEC Metagenomic Detection Pipeline
+====================================
+
+A bioinformatics pipeline for detecting Shiga toxin-producing E. coli (STEC)
+in metagenomic samples using coverage-based gene detection.
+
+Key Features:
+- Parallel processing of multiple samples
+- Configurable quality filters (identity/alignment thresholds)
+- Dynamic classification (EHEC, STEC, NON-STEC)
+- Cloud storage integration (optional)
+
+Author: Anonymized for portfolio demonstration
+License: MIT
+"""
+
+import sys
+import os
+import subprocess
+import csv
+import argparse
+from pathlib import Path
+import concurrent.futures
+import multiprocessing
+from threading import Lock
+from typing import Dict, List, Tuple, Optional
+
+# =============== DEFAULT CONFIGURATION ==============
+DEFAULT_CONFIG = {
+    'max_cpus': 40,
+    'parallel_samples': 10,
+    'threads_per_sample': 4,
+    'min_identity': 80,
+    'min_aligned': 80,
+    'min_coverage_fraction': 0.5,
+}
+
+class STECPipeline:
+    """Main pipeline class for STEC detection in metagenomic samples."""
+    
+    def __init__(self, config: Dict):
+        """
+        Initialize pipeline with configuration.
+        
+        Args:
+            config: Dictionary containing pipeline parameters
+        """
+        self.config = config
+        self.file_lock = Lock()
+        
+        # Setup directories
+        self.base_dir = Path(config['base_dir'])
+        self.results_dir = self.base_dir / 'results'
+        self.minimap_dir = self.results_dir / 'minimap2'
+        self.trimmed_dir = self.results_dir / 'trimmed'
+        self.temp_dir = self.results_dir / 'temp'
+        
+        # Create directories
+        for directory in [self.results_dir, self.minimap_dir, 
+                         self.trimmed_dir, self.temp_dir]:
+            directory.mkdir(parents=True, exist_ok=True)
+        
+        # Database paths
+        self.genes_fasta = Path(config['genes_fasta'])
+        self.genes_bed = Path(config['genes_bed'])
+        
+        # Output files
+        self.final_results = self.results_dir / 'classification_results.tsv'
+        
+    def run_command(self, cmd: str, description: str = "") -> None:
+        """
+        Execute shell command with error handling.
+        
+        Args:
+            cmd: Command to execute
+            description: Optional description for logging
+        """
+        if description:
+            print(f"[{multiprocessing.current_process().name}] {description}")
+        print(f"Running: {cmd}")
+        
+        try:
+            subprocess.run(cmd, shell=True, check=True, 
+                         capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR: Command failed: {cmd}")
+            print(f"STDERR: {e.stderr}")
+            raise
+    
+    def classify_sample(self, genes: List[str]) -> Tuple[str, str]:
+        """
+        Classify sample based on detected genes.
+        
+        Args:
+            genes: List of gene names detected in sample
+            
+        Returns:
+            Tuple of (classification, subtype_string)
+            
+        Classification logic:
+            - EHEC: Has stx genes AND eae gene
+            - STEC: Has stx genes but NO eae
+            - NON-STEC: No stx genes detected
+        """
+        has_stx1 = any("stx1" in g.lower() for g in genes)
+        has_stx2 = any("stx2" in g.lower() for g in genes)
+        has_eae = any("eae" in g.lower() for g in genes)
+        
+        # Determine subtypes
+        subtypes = []
+        if has_stx1:
+            subtypes.append("stx1")
+        if has_stx2:
+            subtypes.append("stx2")
+        subtype_str = ",".join(subtypes) if subtypes else "None"
+        
+        # Classify
+        if (has_stx1 or has_stx2) and has_eae:
+            classification = "EHEC"
+        elif has_stx1 or has_stx2:
+            classification = "STEC"
+        else:
+            classification = "NON-STEC"
+        
+        return classification, subtype_str
+    
+    def trim_reads(self, r1: Path, r2: Path, output_dir: Path, 
+                   sample_name: str) -> Tuple[Path, Path]:
+        """
+        Quality trim reads using fastp.
+        
+        Args:
+            r1: R1 fastq file path
+            r2: R2 fastq file path
+            output_dir: Directory for trimmed output
+            sample_name: Sample identifier
+            
+        Returns:
+            Tuple of (trimmed_r1_path, trimmed_r2_path)
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        trimmed_r1 = output_dir / f"{sample_name}_R1.trimmed.fastq.gz"
+        trimmed_r2 = output_dir / f"{sample_name}_R2.trimmed.fastq.gz"
+        
+        cmd = (f"fastp -i {r1} -I {r2} "
+               f"-o {trimmed_r1} -O {trimmed_r2} "
+               f"--thread {self.config['threads_per_sample']} "
+               f"--qualified_quality_phred 20 "
+               f"--length_required 50")
+        
+        self.run_command(cmd, f"Trimming {sample_name}")
+        
+        return trimmed_r1, trimmed_r2
+    
+    def align_reads(self, trimmed_r1: Path, trimmed_r2: Path, 
+                    output_dir: Path, sample_name: str) -> Path:
+        """
+        Align reads to reference database using minimap2.
+        
+        Args:
+            trimmed_r1: Trimmed R1 reads
+            trimmed_r2: Trimmed R2 reads
+            output_dir: Directory for alignment output
+            sample_name: Sample identifier
+            
+        Returns:
+            Path to sorted BAM file
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        sam_file = output_dir / f"{sample_name}.sam"
+        bam_file = output_dir / f"{sample_name}.bam"
+        
+        # Align with minimap2
+        align_cmd = (f"minimap2 -ax sr "
+                    f"-t {self.config['threads_per_sample']} "
+                    f"{self.genes_fasta} {trimmed_r1} {trimmed_r2} "
+                    f"> {sam_file}")
+        self.run_command(align_cmd, f"Aligning {sample_name}")
+        
+        # Convert to sorted BAM
+        sort_cmd = (f"samtools view -@ {self.config['threads_per_sample']} "
+                   f"-bS {sam_file} | "
+                   f"samtools sort -@ {self.config['threads_per_sample']} "
+                   f"-o {bam_file}")
+        self.run_command(sort_cmd, f"Sorting BAM for {sample_name}")
+        
+        # Index BAM
+        self.run_command(f"samtools index {bam_file}", 
+                        f"Indexing BAM for {sample_name}")
+        
+        # Cleanup SAM
+        sam_file.unlink()
+        
+        return bam_file
+    
+    def filter_alignments(self, bam_file: Path, output_dir: Path, 
+                         sample_name: str) -> Path:
+        """
+        Filter alignments using CoverM based on identity and alignment %.
+        
+        Args:
+            bam_file: Input BAM file
+            output_dir: Directory for filtered output
+            sample_name: Sample identifier
+            
+        Returns:
+            Path to filtered BAM file
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        filtered_bam = output_dir / f"{sample_name}.filtered.bam"
+        
+        cmd = (f"coverm filter "
+               f"--min-read-percent-identity {self.config['min_identity']} "
+               f"--min-read-aligned-percent {self.config['min_aligned']} "
+               f"--bam-files {bam_file} "
+               f"--output-bam-files {filtered_bam} "
+               f"--threads {self.config['threads_per_sample']}")
+        
+        self.run_command(cmd, f"Filtering alignments for {sample_name}")
+        
+        # Index filtered BAM
+        self.run_command(f"samtools index {filtered_bam}", 
+                        f"Indexing filtered BAM for {sample_name}")
+        
+        return filtered_bam
+    
+    def calculate_coverage(self, filtered_bam: Path, output_dir: Path, 
+                          sample_name: str) -> Path:
+        """
+        Calculate per-gene coverage using bedtools.
+        
+        Args:
+            filtered_bam: Filtered BAM file
+            output_dir: Directory for coverage output
+            sample_name: Sample identifier
+            
+        Returns:
+            Path to coverage TSV file
+        """
+        coverage_tsv = output_dir / f"{sample_name}_coverage.tsv"
+        
+        cmd = f"bedtools coverage -a {self.genes_bed} -b {filtered_bam} > {coverage_tsv}"
+        self.run_command(cmd, f"Calculating coverage for {sample_name}")
+        
+        return coverage_tsv
+    
+    def filter_by_coverage_fraction(self, coverage_tsv: Path, 
+                                   output_dir: Path, 
+                                   sample_name: str) -> Tuple[Path, List[str]]:
+        """
+        Filter genes by coverage fraction threshold.
+        
+        Args:
+            coverage_tsv: Input coverage file
+            output_dir: Directory for filtered output
+            sample_name: Sample identifier
+            
+        Returns:
+            Tuple of (filtered_tsv_path, list_of_detected_genes)
+        """
+        filtered_tsv = output_dir / f"{sample_name}_coverage.filtered.tsv"
+        detected_genes = []
+        
+        min_fraction = self.config['min_coverage_fraction']
+        
+        with open(coverage_tsv) as infile, open(filtered_tsv, 'w') as outfile:
+            header = infile.readline().strip().split('\t')
+            outfile.write('\t'.join(header) + '\n')
+            
+            # Find fraction column (handle different bedtools versions)
+            frac_col_names = ['fraction_covered', 'fraction_genome', 
+                            'fraction', 'covered_fraction']
+            frac_col_idx = None
+            
+            for col_name in frac_col_names:
+                if col_name in header:
+                    frac_col_idx = header.index(col_name)
+                    break
+            
+            if frac_col_idx is None:
+                frac_col_idx = len(header) - 1  # Default to last column
+            
+            # Filter by coverage fraction
+            for line in infile:
+                cols = line.strip().split('\t')
+                
+                if len(cols) <= frac_col_idx:
+                    continue
+                
+                try:
+                    fraction = float(cols[frac_col_idx])
+                except ValueError:
+                    continue
+                
+                if fraction >= min_fraction:
+                    outfile.write('\t'.join(cols) + '\n')
+                    detected_genes.append(cols[0])  # Gene name in first column
+        
+        return filtered_tsv, detected_genes
+    
+    def process_sample(self, sample_data: Tuple) -> None:
+        """
+        Process a single sample through the complete pipeline.
+        
+        Args:
+            sample_data: Tuple of (sample_name, r1_path, r2_path, metadata, worker_id)
+        """
+        sample_name, r1_path, r2_path, metadata, worker_id = sample_data
+        
+        print(f"\n{'='*60}")
+        print(f"Processing: {sample_name}")
+        print(f"{'='*60}")
+        
+        try:
+            # Create worker-specific directories to avoid conflicts
+            worker_trim_dir = self.trimmed_dir / f"worker_{worker_id}"
+            worker_map_dir = self.minimap_dir / f"worker_{worker_id}"
+            
+            # Step 1: Trim reads
+            trimmed_r1, trimmed_r2 = self.trim_reads(
+                Path(r1_path), Path(r2_path), 
+                worker_trim_dir, sample_name
+            )
+            
+            # Step 2: Align reads
+            bam_file = self.align_reads(
+                trimmed_r1, trimmed_r2, 
+                worker_map_dir, sample_name
+            )
+            
+            # Step 3: Filter alignments
+            filtered_bam = self.filter_alignments(
+                bam_file, worker_map_dir, sample_name
+            )
+            
+            # Step 4: Calculate coverage
+            coverage_tsv = self.calculate_coverage(
+                filtered_bam, worker_map_dir, sample_name
+            )
+            
+            # Step 5: Filter by coverage fraction and get detected genes
+            filtered_tsv, detected_genes = self.filter_by_coverage_fraction(
+                coverage_tsv, worker_map_dir, sample_name
+            )
+            
+            # Step 6: Classify sample
+            classification, subtype = self.classify_sample(detected_genes)
+            
+            print(f"\n[RESULTS] {sample_name}:")
+            print(f"  Classification: {classification}")
+            print(f"  Subtype: {subtype}")
+            print(f"  Genes detected: {len(detected_genes)}")
+            
+            # Step 7: Save results
+            self.save_results(sample_name, classification, subtype, metadata)
+            
+            # Step 8: Cleanup intermediate files
+            if self.config.get('cleanup', True):
+                self.cleanup_intermediate_files(
+                    [trimmed_r1, trimmed_r2, bam_file]
+                )
+            
+            print(f"[COMPLETE] {sample_name}")
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to process {sample_name}: {e}")
+            raise
+    
+    def save_results(self, sample_name: str, classification: str, 
+                    subtype: str, metadata: Dict) -> None:
+        """
+        Save classification results to output file.
+        
+        Args:
+            sample_name: Sample identifier
+            classification: STEC classification
+            subtype: Subtype string
+            metadata: Additional sample metadata
+        """
+        with self.file_lock:
+            # Create header if file doesn't exist
+            if not self.final_results.exists():
+                header = ['sample', 'classification', 'subtype', 
+                         'read_length', 'coverage']
+                with open(self.final_results, 'w') as f:
+                    f.write('\t'.join(header) + '\n')
+            
+            # Append results
+            row = [
+                sample_name,
+                classification,
+                subtype,
+                metadata.get('read_length', 'NA'),
+                metadata.get('coverage', 'NA')
+            ]
+            
+            with open(self.final_results, 'a') as f:
+                f.write('\t'.join(map(str, row)) + '\n')
+    
+    def cleanup_intermediate_files(self, file_paths: List[Path]) -> None:
+        """
+        Remove intermediate files to save disk space.
+        
+        Args:
+            file_paths: List of file paths to remove
+        """
+        for file_path in file_paths:
+            if file_path.exists():
+                file_path.unlink()
+    
+    def run_parallel(self, samples: List[Tuple]) -> None:
+        """
+        Process multiple samples in parallel.
+        
+        Args:
+            samples: List of sample data tuples
+        """
+        print(f"\nProcessing {len(samples)} samples with "
+              f"{self.config['parallel_samples']} parallel workers")
+        
+        # Add worker IDs to samples
+        samples_with_workers = [
+            (*sample, i % self.config['parallel_samples']) 
+            for i, sample in enumerate(samples)
+        ]
+        
+        # Process in parallel
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=self.config['parallel_samples']
+        ) as executor:
+            futures = [
+                executor.submit(self.process_sample, sample) 
+                for sample in samples_with_workers
+            ]
+            
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"[ERROR] Sample processing failed: {e}")
+
+
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='STEC Detection Pipeline for Metagenomic Samples',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage
+  python stec_pipeline.py --input samples.csv --base-dir ./stec_analysis
+  
+  # Custom parameters
+  python stec_pipeline.py --input samples.csv --base-dir ./analysis \\
+      --parallel 20 --threads 8 --min-identity 90
+        """
+    )
+    
+    # Required arguments
+    parser.add_argument('--input', required=True,
+                       help='Input CSV with columns: sample_name,r1_path,r2_path,read_length,coverage')
+    parser.add_argument('--base-dir', required=True,
+                       help='Base directory for analysis')
+    parser.add_argument('--genes-fasta', required=True,
+                       help='Path to STEC genes FASTA database')
+    parser.add_argument('--genes-bed', required=True,
+                       help='Path to genes BED file')
+    
+    # Optional parameters
+    parser.add_argument('--parallel', type=int, default=10,
+                       help='Number of samples to process in parallel (default: 10)')
+    parser.add_argument('--threads', type=int, default=4,
+                       help='Threads per sample (default: 4)')
+    parser.add_argument('--min-identity', type=int, default=80,
+                       help='Minimum read identity %% (default: 80)')
+    parser.add_argument('--min-aligned', type=int, default=80,
+                       help='Minimum read aligned %% (default: 80)')
+    parser.add_argument('--min-coverage', type=float, default=0.5,
+                       help='Minimum gene coverage fraction (default: 0.5)')
+    parser.add_argument('--no-cleanup', action='store_true',
+                       help='Keep intermediate files')
+    
+    return parser.parse_args()
+
+
+def load_samples(csv_path: str) -> List[Tuple]:
+    """
+    Load sample information from CSV file.
+    
+    Args:
+        csv_path: Path to input CSV
+        
+    Returns:
+        List of tuples: (sample_name, r1_path, r2_path, metadata_dict)
+    """
+    samples = []
+    
+    with open(csv_path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            sample_name = row['sample_name']
+            r1_path = row['r1_path']
+            r2_path = row['r2_path']
+            
+            metadata = {
+                'read_length': row.get('read_length', 'NA'),
+                'coverage': row.get('coverage', 'NA')
+            }
+            
+            samples.append((sample_name, r1_path, r2_path, metadata))
+    
+    return samples
+
+
+def main():
+    """Main entry point."""
+    args = parse_arguments()
+    
+    # Build configuration
+    config = {
+        'base_dir': args.base_dir,
+        'genes_fasta': args.genes_fasta,
+        'genes_bed': args.genes_bed,
+        'parallel_samples': args.parallel,
+        'threads_per_sample': args.threads,
+        'min_identity': args.min_identity,
+        'min_aligned': args.min_aligned,
+        'min_coverage_fraction': args.min_coverage,
+        'cleanup': not args.no_cleanup,
+    }
+    
+    print("\n" + "="*60)
+    print("STEC Metagenomic Detection Pipeline")
+    print("="*60)
+    print(f"Configuration:")
+    for key, value in config.items():
+        print(f"  {key}: {value}")
+    print("="*60 + "\n")
+    
+    # Load samples
+    samples = load_samples(args.input)
+    print(f"Loaded {len(samples)} samples from {args.input}")
+    
+    # Initialize and run pipeline
+    pipeline = STECPipeline(config)
+    pipeline.run_parallel(samples)
+    
+    print(f"\n{'='*60}")
+    print(f"[COMPLETE] All processing finished!")
+    print(f"Results saved to: {pipeline.final_results}")
+    print(f"{'='*60}\n")
+
+
+if __name__ == "__main__":
+    main()
