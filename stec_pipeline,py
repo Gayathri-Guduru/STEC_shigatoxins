@@ -1,560 +1,1191 @@
 #!/usr/bin/env python3
 """
-STEC Metagenomic Detection Pipeline
-====================================
-
-A bioinformatics pipeline for detecting Shiga toxin-producing E. coli (STEC)
-in metagenomic samples using coverage-based gene detection.
-
-Key Features:
-- Parallel processing of multiple samples
-- Configurable quality filters (identity/alignment thresholds)
-- Dynamic classification (EHEC, STEC, NON-STEC)
-- Cloud storage integration (optional)
-
-Author: Anonymized for portfolio demonstration
-License: MIT
+EMM Typing Pipeline for Streptococcus pyogenes
+A three-round iterative alignment and clustering pipeline for bacterial strain typing
+from metagenomic and isolate sequencing data.
 """
 
-import sys
 import os
+import sys
+import pandas as pd
+import pysam
+import pickle
+import logging
 import subprocess
-import csv
+import time
+import json
+import glob
+import re
+import traceback
+import shutil
+from collections import defaultdict, Counter
+from Bio import SeqIO
+from multiprocessing import Pool, Manager, cpu_count
+from functools import partial
+import numpy as np
 import argparse
-from pathlib import Path
-import concurrent.futures
-import multiprocessing
-from threading import Lock
-from typing import Dict, List, Tuple, Optional
+import itertools
 
-# =============== DEFAULT CONFIGURATION ==============
-DEFAULT_CONFIG = {
-    'max_cpus': 40,
-    'parallel_samples': 10,
-    'threads_per_sample': 4,
-    'min_identity': 80,
-    'min_aligned': 80,
-    'min_coverage_fraction': 0.5,
-}
+# Configuration - These should be set via command line arguments or config file
+DEFAULT_BASE_DIR = "/path/to/project/reference"
+DEFAULT_FASTQ_DIR = "/path/to/project/fastq_files"
+DEFAULT_TOOL_DIR = "/path/to/project/emm-typing-tool"
+GENOME_SIZE = 1850000  # S. pyogenes genome size (base pairs)
 
-class STECPipeline:
-    """Main pipeline class for STEC detection in metagenomic samples."""
-    
-    def __init__(self, config: Dict):
-        """
-        Initialize pipeline with configuration.
-        
-        Args:
-            config: Dictionary containing pipeline parameters
-        """
-        self.config = config
-        self.file_lock = Lock()
-        
-        # Setup directories
-        self.base_dir = Path(config['base_dir'])
-        self.results_dir = self.base_dir / 'results'
-        self.minimap_dir = self.results_dir / 'minimap2'
-        self.trimmed_dir = self.results_dir / 'trimmed'
-        self.temp_dir = self.results_dir / 'temp'
-        
-        # Create directories
-        for directory in [self.results_dir, self.minimap_dir, 
-                         self.trimmed_dir, self.temp_dir]:
-            directory.mkdir(parents=True, exist_ok=True)
-        
-        # Database paths
-        self.genes_fasta = Path(config['genes_fasta'])
-        self.genes_bed = Path(config['genes_bed'])
-        
-        # Output files
-        self.final_results = self.results_dir / 'classification_results.tsv'
-        
-    def run_command(self, cmd: str, description: str = "") -> None:
-        """
-        Execute shell command with error handling.
-        
-        Args:
-            cmd: Command to execute
-            description: Optional description for logging
-        """
-        if description:
-            print(f"[{multiprocessing.current_process().name}] {description}")
-        print(f"Running: {cmd}")
-        
-        try:
-            subprocess.run(cmd, shell=True, check=True, 
-                         capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            print(f"ERROR: Command failed: {cmd}")
-            print(f"STDERR: {e.stderr}")
-            raise
-    
-    def classify_sample(self, genes: List[str]) -> Tuple[str, str]:
-        """
-        Classify sample based on detected genes.
-        
-        Args:
-            genes: List of gene names detected in sample
-            
-        Returns:
-            Tuple of (classification, subtype_string)
-            
-        Classification logic:
-            - EHEC: Has stx genes AND eae gene
-            - STEC: Has stx genes but NO eae
-            - NON-STEC: No stx genes detected
-        """
-        has_stx1 = any("stx1" in g.lower() for g in genes)
-        has_stx2 = any("stx2" in g.lower() for g in genes)
-        has_eae = any("eae" in g.lower() for g in genes)
-        
-        # Determine subtypes
-        subtypes = []
-        if has_stx1:
-            subtypes.append("stx1")
-        if has_stx2:
-            subtypes.append("stx2")
-        subtype_str = ",".join(subtypes) if subtypes else "None"
-        
-        # Classify
-        if (has_stx1 or has_stx2) and has_eae:
-            classification = "EHEC"
-        elif has_stx1 or has_stx2:
-            classification = "STEC"
-        else:
-            classification = "NON-STEC"
-        
-        return classification, subtype_str
-    
-    def trim_reads(self, r1: Path, r2: Path, output_dir: Path, 
-                   sample_name: str) -> Tuple[Path, Path]:
-        """
-        Quality trim reads using fastp.
-        
-        Args:
-            r1: R1 fastq file path
-            r2: R2 fastq file path
-            output_dir: Directory for trimmed output
-            sample_name: Sample identifier
-            
-        Returns:
-            Tuple of (trimmed_r1_path, trimmed_r2_path)
-        """
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        trimmed_r1 = output_dir / f"{sample_name}_R1.trimmed.fastq.gz"
-        trimmed_r2 = output_dir / f"{sample_name}_R2.trimmed.fastq.gz"
-        
-        cmd = (f"fastp -i {r1} -I {r2} "
-               f"-o {trimmed_r1} -O {trimmed_r2} "
-               f"--thread {self.config['threads_per_sample']} "
-               f"--qualified_quality_phred 20 "
-               f"--length_required 50")
-        
-        self.run_command(cmd, f"Trimming {sample_name}")
-        
-        return trimmed_r1, trimmed_r2
-    
-    def align_reads(self, trimmed_r1: Path, trimmed_r2: Path, 
-                    output_dir: Path, sample_name: str) -> Path:
-        """
-        Align reads to reference database using minimap2.
-        
-        Args:
-            trimmed_r1: Trimmed R1 reads
-            trimmed_r2: Trimmed R2 reads
-            output_dir: Directory for alignment output
-            sample_name: Sample identifier
-            
-        Returns:
-            Path to sorted BAM file
-        """
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        sam_file = output_dir / f"{sample_name}.sam"
-        bam_file = output_dir / f"{sample_name}.bam"
-        
-        # Align with minimap2
-        align_cmd = (f"minimap2 -ax sr "
-                    f"-t {self.config['threads_per_sample']} "
-                    f"{self.genes_fasta} {trimmed_r1} {trimmed_r2} "
-                    f"> {sam_file}")
-        self.run_command(align_cmd, f"Aligning {sample_name}")
-        
-        # Convert to sorted BAM
-        sort_cmd = (f"samtools view -@ {self.config['threads_per_sample']} "
-                   f"-bS {sam_file} | "
-                   f"samtools sort -@ {self.config['threads_per_sample']} "
-                   f"-o {bam_file}")
-        self.run_command(sort_cmd, f"Sorting BAM for {sample_name}")
-        
-        # Index BAM
-        self.run_command(f"samtools index {bam_file}", 
-                        f"Indexing BAM for {sample_name}")
-        
-        # Cleanup SAM
-        sam_file.unlink()
-        
-        return bam_file
-    
-    def filter_alignments(self, bam_file: Path, output_dir: Path, 
-                         sample_name: str) -> Path:
-        """
-        Filter alignments using CoverM based on identity and alignment %.
-        
-        Args:
-            bam_file: Input BAM file
-            output_dir: Directory for filtered output
-            sample_name: Sample identifier
-            
-        Returns:
-            Path to filtered BAM file
-        """
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        filtered_bam = output_dir / f"{sample_name}.filtered.bam"
-        
-        cmd = (f"coverm filter "
-               f"--min-read-percent-identity {self.config['min_identity']} "
-               f"--min-read-aligned-percent {self.config['min_aligned']} "
-               f"--bam-files {bam_file} "
-               f"--output-bam-files {filtered_bam} "
-               f"--threads {self.config['threads_per_sample']}")
-        
-        self.run_command(cmd, f"Filtering alignments for {sample_name}")
-        
-        # Index filtered BAM
-        self.run_command(f"samtools index {filtered_bam}", 
-                        f"Indexing filtered BAM for {sample_name}")
-        
-        return filtered_bam
-    
-    def calculate_coverage(self, filtered_bam: Path, output_dir: Path, 
-                          sample_name: str) -> Path:
-        """
-        Calculate per-gene coverage using bedtools.
-        
-        Args:
-            filtered_bam: Filtered BAM file
-            output_dir: Directory for coverage output
-            sample_name: Sample identifier
-            
-        Returns:
-            Path to coverage TSV file
-        """
-        coverage_tsv = output_dir / f"{sample_name}_coverage.tsv"
-        
-        cmd = f"bedtools coverage -a {self.genes_bed} -b {filtered_bam} > {coverage_tsv}"
-        self.run_command(cmd, f"Calculating coverage for {sample_name}")
-        
-        return coverage_tsv
-    
-    def filter_by_coverage_fraction(self, coverage_tsv: Path, 
-                                   output_dir: Path, 
-                                   sample_name: str) -> Tuple[Path, List[str]]:
-        """
-        Filter genes by coverage fraction threshold.
-        
-        Args:
-            coverage_tsv: Input coverage file
-            output_dir: Directory for filtered output
-            sample_name: Sample identifier
-            
-        Returns:
-            Tuple of (filtered_tsv_path, list_of_detected_genes)
-        """
-        filtered_tsv = output_dir / f"{sample_name}_coverage.filtered.tsv"
-        detected_genes = []
-        
-        min_fraction = self.config['min_coverage_fraction']
-        
-        with open(coverage_tsv) as infile, open(filtered_tsv, 'w') as outfile:
-            header = infile.readline().strip().split('\t')
-            outfile.write('\t'.join(header) + '\n')
-            
-            # Find fraction column (handle different bedtools versions)
-            frac_col_names = ['fraction_covered', 'fraction_genome', 
-                            'fraction', 'covered_fraction']
-            frac_col_idx = None
-            
-            for col_name in frac_col_names:
-                if col_name in header:
-                    frac_col_idx = header.index(col_name)
-                    break
-            
-            if frac_col_idx is None:
-                frac_col_idx = len(header) - 1  # Default to last column
-            
-            # Filter by coverage fraction
-            for line in infile:
-                cols = line.strip().split('\t')
-                
-                if len(cols) <= frac_col_idx:
-                    continue
-                
-                try:
-                    fraction = float(cols[frac_col_idx])
-                except ValueError:
-                    continue
-                
-                if fraction >= min_fraction:
-                    outfile.write('\t'.join(cols) + '\n')
-                    detected_genes.append(cols[0])  # Gene name in first column
-        
-        return filtered_tsv, detected_genes
-    
-    def process_sample(self, sample_data: Tuple) -> None:
-        """
-        Process a single sample through the complete pipeline.
-        
-        Args:
-            sample_data: Tuple of (sample_name, r1_path, r2_path, metadata, worker_id)
-        """
-        sample_name, r1_path, r2_path, metadata, worker_id = sample_data
-        
-        print(f"\n{'='*60}")
-        print(f"Processing: {sample_name}")
-        print(f"{'='*60}")
-        
-        try:
-            # Create worker-specific directories to avoid conflicts
-            worker_trim_dir = self.trimmed_dir / f"worker_{worker_id}"
-            worker_map_dir = self.minimap_dir / f"worker_{worker_id}"
-            
-            # Step 1: Trim reads
-            trimmed_r1, trimmed_r2 = self.trim_reads(
-                Path(r1_path), Path(r2_path), 
-                worker_trim_dir, sample_name
-            )
-            
-            # Step 2: Align reads
-            bam_file = self.align_reads(
-                trimmed_r1, trimmed_r2, 
-                worker_map_dir, sample_name
-            )
-            
-            # Step 3: Filter alignments
-            filtered_bam = self.filter_alignments(
-                bam_file, worker_map_dir, sample_name
-            )
-            
-            # Step 4: Calculate coverage
-            coverage_tsv = self.calculate_coverage(
-                filtered_bam, worker_map_dir, sample_name
-            )
-            
-            # Step 5: Filter by coverage fraction and get detected genes
-            filtered_tsv, detected_genes = self.filter_by_coverage_fraction(
-                coverage_tsv, worker_map_dir, sample_name
-            )
-            
-            # Step 6: Classify sample
-            classification, subtype = self.classify_sample(detected_genes)
-            
-            print(f"\n[RESULTS] {sample_name}:")
-            print(f"  Classification: {classification}")
-            print(f"  Subtype: {subtype}")
-            print(f"  Genes detected: {len(detected_genes)}")
-            
-            # Step 7: Save results
-            self.save_results(sample_name, classification, subtype, metadata)
-            
-            # Step 8: Cleanup intermediate files
-            if self.config.get('cleanup', True):
-                self.cleanup_intermediate_files(
-                    [trimmed_r1, trimmed_r2, bam_file]
-                )
-            
-            print(f"[COMPLETE] {sample_name}")
-            
-        except Exception as e:
-            print(f"[ERROR] Failed to process {sample_name}: {e}")
-            raise
-    
-    def save_results(self, sample_name: str, classification: str, 
-                    subtype: str, metadata: Dict) -> None:
-        """
-        Save classification results to output file.
-        
-        Args:
-            sample_name: Sample identifier
-            classification: STEC classification
-            subtype: Subtype string
-            metadata: Additional sample metadata
-        """
-        with self.file_lock:
-            # Create header if file doesn't exist
-            if not self.final_results.exists():
-                header = ['sample', 'classification', 'subtype', 
-                         'read_length', 'coverage']
-                with open(self.final_results, 'w') as f:
-                    f.write('\t'.join(header) + '\n')
-            
-            # Append results
-            row = [
-                sample_name,
-                classification,
-                subtype,
-                metadata.get('read_length', 'NA'),
-                metadata.get('coverage', 'NA')
-            ]
-            
-            with open(self.final_results, 'a') as f:
-                f.write('\t'.join(map(str, row)) + '\n')
-    
-    def cleanup_intermediate_files(self, file_paths: List[Path]) -> None:
-        """
-        Remove intermediate files to save disk space.
-        
-        Args:
-            file_paths: List of file paths to remove
-        """
-        for file_path in file_paths:
-            if file_path.exists():
-                file_path.unlink()
-    
-    def run_parallel(self, samples: List[Tuple]) -> None:
-        """
-        Process multiple samples in parallel.
-        
-        Args:
-            samples: List of sample data tuples
-        """
-        print(f"\nProcessing {len(samples)} samples with "
-              f"{self.config['parallel_samples']} parallel workers")
-        
-        # Add worker IDs to samples
-        samples_with_workers = [
-            (*sample, i % self.config['parallel_samples']) 
-            for i, sample in enumerate(samples)
-        ]
-        
-        # Process in parallel
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=self.config['parallel_samples']
-        ) as executor:
-            futures = [
-                executor.submit(self.process_sample, sample) 
-                for sample in samples_with_workers
-            ]
-            
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    print(f"[ERROR] Sample processing failed: {e}")
+# Global variable for processing mode
+PROCESSING_MODE = None
 
 
-def parse_arguments():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description='STEC Detection Pipeline for Metagenomic Samples',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Basic usage
-  python stec_pipeline.py --input samples.csv --base-dir ./stec_analysis
+def setup_logger(log_file, process_id=None):
   
-  # Custom parameters
-  python stec_pipeline.py --input samples.csv --base-dir ./analysis \\
-      --parallel 20 --threads 8 --min-identity 90
-        """
+    log_dir = os.path.dirname(log_file)
+    os.makedirs(log_dir, exist_ok=True)
+    
+    logger = logging.getLogger(f'emm_pipeline_{process_id if process_id else "main"}')
+    logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers to avoid duplicates
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    # File handler
+    handler = logging.FileHandler(log_file)
+    formatter = logging.Formatter(
+        f'%(asctime)s - {process_id if process_id else "main"} - %(levelname)s - %(message)s'
     )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
     
-    # Required arguments
-    parser.add_argument('--input', required=True,
-                       help='Input CSV with columns: sample_name,r1_path,r2_path,read_length,coverage')
-    parser.add_argument('--base-dir', required=True,
-                       help='Base directory for analysis')
-    parser.add_argument('--genes-fasta', required=True,
-                       help='Path to STEC genes FASTA database')
-    parser.add_argument('--genes-bed', required=True,
-                       help='Path to genes BED file')
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
     
-    # Optional parameters
-    parser.add_argument('--parallel', type=int, default=10,
-                       help='Number of samples to process in parallel (default: 10)')
-    parser.add_argument('--threads', type=int, default=4,
-                       help='Threads per sample (default: 4)')
-    parser.add_argument('--min-identity', type=int, default=80,
-                       help='Minimum read identity %% (default: 80)')
-    parser.add_argument('--min-aligned', type=int, default=80,
-                       help='Minimum read aligned %% (default: 80)')
-    parser.add_argument('--min-coverage', type=float, default=0.5,
-                       help='Minimum gene coverage fraction (default: 0.5)')
-    parser.add_argument('--no-cleanup', action='store_true',
-                       help='Keep intermediate files')
-    
-    return parser.parse_args()
+    return logger
 
 
-def load_samples(csv_path: str) -> List[Tuple]:
+def extract_wastewater_id(filename):
+    basename = os.path.basename(filename)
+    ww_pattern = r'(ww\d+)'
+    match = re.search(ww_pattern, basename, re.IGNORECASE)
+    
+    if match:
+        return match.group(1).lower()
+    
+    return None
+
+
+def has_coverage_identifier(filename):
+        basename = os.path.basename(filename)
+    
+    coverage_patterns = [
+        r'_\d+M_',          # Matches _99M_, _48M_
+        r'_\d+\.\d+X_',     # Matches _0.5X_
+        r'_\d+X_'           # Matches _50X_
+    ]
+    
+    for pattern in coverage_patterns:
+        if re.search(pattern, basename):
+            return True
+    
+    return False
+
+
+def count_sra_ids_in_filename(filename):
+    
+    basename = os.path.basename(filename)
+    sra_prefix = r'(ERR|ERS|SRR|SRS|DRR|DRS)'
+    pattern = rf'({sra_prefix}\d+)_[\d.]+X'
+    matches = re.findall(pattern, basename)
+    
+    return len(matches)
+
+
+def extract_coverage_from_filename(filename, mode):
+   
+    basename = os.path.basename(filename)
+    sra_prefix = r'(ERR|ERS|SRR|SRS|DRR|DRS)'
+    
+    # Extract all SRA_ID + coverage patterns
+    pattern = rf'({sra_prefix}\d+)_([\d.]+X)'
+    matches = re.findall(pattern, basename)
+    
+    ww_id = extract_wastewater_id(basename)
+    
+    # Mode-specific coverage extraction
+    if mode == 'only_wastewater':
+        if ww_id and not has_coverage_identifier(basename):
+            return ww_id
+        return None
+        
+    elif mode == 'only_wastewater_downsampled':
+        if ww_id and has_coverage_identifier(basename):
+            coverage_match = re.search(r'_(\d+(?:\.\d+)?[MX])_', basename)
+            if coverage_match:
+                return f"{ww_id}_{coverage_match.group(1)}"
+            return ww_id
+        return None
+        
+    elif mode == 'metagenomics':
+        # Multiple isolates + wastewater
+        if len(matches) >= 2 and ww_id:
+            coverages = [match[2] for match in matches]
+            return "_".join(coverages) + f"_{ww_id}"
+        return None
+        
+    elif mode == 'mixed_isolates':
+        # Multiple isolates, no wastewater
+        if len(matches) >= 2 and not ww_id:
+            coverages = [match[2] for match in matches]
+            return "_".join(coverages)
+        return None
+        
+    elif mode in ['isolates', 'isolates_downsampled']:
+        return None
+    
+    return None
+
+
+def extract_sra_id_from_filename(filename, mode):
+   
+    basename = os.path.basename(filename)
+    sra_prefix = r'(ERR|ERS|SRR|SRS|DRR|DRS)'
+    
+    # Single isolate modes
+    if mode == 'isolates':
+        pattern = rf'^({sra_prefix}\d+)_R[12]'
+        match = re.search(pattern, basename)
+        return match.group(1) if match else None
+        
+    if mode == 'isolates_downsampled':
+        pattern = rf'^({sra_prefix}\d+)_[\d.]+X_R[12]'
+        match = re.search(pattern, basename)
+        return match.group(1) if match else None
+    
+    # Extract all SRA IDs for mixed samples
+    pattern = rf'({sra_prefix}\d+)_[\d.]+X'
+    matches = re.findall(pattern, basename)
+    ww_id = extract_wastewater_id(basename)
+    
+    # Wastewater modes
+    if mode == 'only_wastewater':
+        if ww_id and not has_coverage_identifier(basename):
+            return ww_id
+        return None
+        
+    elif mode == 'only_wastewater_downsampled':
+        if ww_id and has_coverage_identifier(basename):
+            coverage_match = re.search(r'_(\d+(?:\.\d+)?[MX])_', basename)
+            if coverage_match:
+                return f"{ww_id}_{coverage_match.group(1)}"
+            return ww_id
+        return None
+    
+    # Mixed sample modes
+    elif mode == 'metagenomics':
+        if len(matches) >= 2 and ww_id:
+            sra_ids = sorted([match[0] for match in matches])
+            return "_".join(sra_ids) + f"_{ww_id}"
+        return None
+        
+    elif mode == 'mixed_isolates':
+        if len(matches) >= 2 and not ww_id:
+            sra_ids = sorted([match[0] for match in matches])
+            return "_".join(sra_ids)
+        return None
+    
+    return None
+
+
+def parse_coverage_value(coverage_str):
     """
-    Load sample information from CSV file.
+    Parse coverage string to numeric value for comparisons.
     
     Args:
-        csv_path: Path to input CSV
+        coverage_str: Coverage string (e.g., "75X", "0.5X")
         
     Returns:
-        List of tuples: (sample_name, r1_path, r2_path, metadata_dict)
+        Float coverage value
     """
-    samples = []
+    if not coverage_str:
+        return 0.0
     
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            sample_name = row['sample_name']
-            r1_path = row['r1_path']
-            r2_path = row['r2_path']
+    if 'wastewater' in coverage_str.lower() or 'ww' in coverage_str.lower():
+        return 0.0
+    
+    numeric_part = coverage_str.upper().replace('X', '').replace('WW', '').split('_')[0]
+    
+    try:
+        return float(numeric_part)
+    except ValueError:
+        return 0.0
+
+
+def load_metadata(metadata_file):
+    """
+    Load sample metadata from CSV file.
+    
+    Expected format: SRA_ID, Actual_emm-type
+    
+    Args:
+        metadata_file: Path to metadata CSV
+        
+    Returns:
+        Dictionary mapping SRA_ID to emm-type
+    """
+    metadata = {}
+    
+    try:
+        if os.path.exists(metadata_file):
+            metadata_df = pd.read_csv(metadata_file)
+            for _, row in metadata_df.iterrows():
+                sra_id = str(row['SRA_ID'])
+                metadata[sra_id] = str(row['Actual_emm-type'])
+            print(f"Loaded metadata for {len(metadata)} samples from {metadata_file}")
+        else:
+            print(f"Warning: Metadata file not found: {metadata_file}")
+    
+    except Exception as e:
+        print(f"Warning: Could not load metadata: {e}")
+    
+    return metadata
+
+
+def load_mixed_isolates_metadata(metadata_file):
+    """
+    Load metadata for mixed isolate samples.
+    
+    Expected format: SRA_ID (combined), Actual_emm_type, coverage, ID
+    
+    Args:
+        metadata_file: Path to mixed isolates metadata CSV
+        
+    Returns:
+        Dictionary with sample information
+    """
+    metadata = {}
+    
+    try:
+        if os.path.exists(metadata_file):
+            metadata_df = pd.read_csv(metadata_file)
+            for _, row in metadata_df.iterrows():
+                combined_sra_id = str(row['SRA_ID'])
+                actual_emm_types = str(row['Actual_emm_type'])
+                coverage = str(row['coverage'])
+                unique_id = str(row['ID'])
+                
+                metadata[combined_sra_id] = {
+                    'emm_types': actual_emm_types,
+                    'coverage': coverage,
+                    'id': unique_id
+                }
+            print(f"Loaded mixed isolates metadata for {len(metadata)} sample combinations")
+        else:
+            print(f"Warning: Mixed isolates metadata file not found: {metadata_file}")
+    
+    except Exception as e:
+        print(f"Warning: Could not load mixed isolates metadata: {e}")
+    
+    return metadata
+
+
+def load_coverage_data(coverage_file):
+    """
+    Load pre-calculated coverage data from CSV.
+    
+    Args:
+        coverage_file: Path to coverage CSV
+        
+    Returns:
+        Dictionary mapping SRA_ID to coverage value
+    """
+    coverage_data = {}
+    
+    try:
+        if os.path.exists(coverage_file):
+            coverage_df = pd.read_csv(coverage_file)
+            for _, row in coverage_df.iterrows():
+                sra_id = str(row['SRA_ID'])
+                coverage = str(row['coverage'])
+                coverage_data[sra_id] = coverage
+            print(f"Loaded coverage data for {len(coverage_data)} samples")
+        else:
+            print(f"Warning: Coverage file not found: {coverage_file}")
+    
+    except Exception as e:
+        print(f"Warning: Could not load coverage data: {e}")
+    
+    return coverage_data
+
+
+def find_sample_fastqs(fastq_dir, metadata_sra_ids, mode, coverage_data=None):
+  
+    samples = {}
+    total_files_found = 0
+    valid_samples_found = 0
+    skipped_single_isolate = 0
+    skipped_wrong_mode = 0
+    skipped_other = 0
+    
+    mode_description = {
+        'only_wastewater': 'Only wastewater samples (no coverage identifiers)',
+        'only_wastewater_downsampled': 'Only wastewater samples (with coverage identifiers)',
+        'metagenomics': '2+ isolates + wastewater',
+        'mixed_isolates': '2+ isolates without wastewater',
+        'isolates': 'Single isolates without coverage in filename',
+        'isolates_downsampled': 'Single isolates WITH coverage in filename'
+    }
+    
+    print(f"\nScanning directory: {fastq_dir}")
+    print(f"Mode: {mode} ({mode_description.get(mode, 'unknown')})")
+    
+    # Wastewater modes use flat directory structure
+    if mode in ['only_wastewater', 'only_wastewater_downsampled']:
+        print("Using flat directory structure (files directly in input directory)")
+        
+        fastq_files = glob.glob(os.path.join(fastq_dir, "*.fastq.gz"))
+        total_files_found = len(fastq_files)
+        print(f"Found {total_files_found} FASTQ files in directory")
+        
+        file_groups = defaultdict(lambda: {'r1': None, 'r2': None})
+        
+        for fastq_file in fastq_files:
+            basename = os.path.basename(fastq_file)
             
-            metadata = {
-                'read_length': row.get('read_length', 'NA'),
-                'coverage': row.get('coverage', 'NA')
-            }
+            num_sra_ids = count_sra_ids_in_filename(basename)
+            has_wastewater = extract_wastewater_id(basename) is not None
+            has_coverage_id = has_coverage_identifier(basename)
             
-            samples.append((sample_name, r1_path, r2_path, metadata))
+            # Mode-specific filtering
+            if mode == 'only_wastewater':
+                if not has_wastewater or has_coverage_id:
+                    skipped_wrong_mode += 1
+                    continue
+            elif mode == 'only_wastewater_downsampled':
+                if not has_wastewater or not has_coverage_id:
+                    skipped_wrong_mode += 1
+                    continue
+            
+            extracted_sra_id = extract_sra_id_from_filename(basename, mode)
+            if not extracted_sra_id:
+                skipped_other += 1
+                continue
+            
+            coverage_from_filename = extract_coverage_from_filename(basename, mode)
+            
+            if coverage_from_filename:
+                coverage_key = coverage_from_filename
+                # Match R1 or R2 pattern
+                if re.search(r'_R1[_.]', basename) or re.search(r'_R1\.fastq', basename):
+                    file_groups[(extracted_sra_id, coverage_key)]['r1'] = fastq_file
+                elif re.search(r'_R2[_.]', basename) or re.search(r'_R2\.fastq', basename):
+                    file_groups[(extracted_sra_id, coverage_key)]['r2'] = fastq_file
+        
+        # Process each file group
+        for (sample_id, coverage_key), files in file_groups.items():
+            if files['r1'] and files['r2']:
+                sample_info = {
+                    'r1': files['r1'],
+                    'r2': files['r2'],
+                    'coverage': coverage_key,
+                    'coverage_value': 0.0
+                }
+                
+                if sample_id not in samples:
+                    samples[sample_id] = []
+                
+                samples[sample_id].append(sample_info)
+                valid_samples_found += 1
+                print(f" ✓ Found VALID sample ({mode}): {sample_id} with coverage {coverage_key}")
+    
+    else:
+        # Subdirectory structure for other modes
+        subdirs = [d for d in os.listdir(fastq_dir) if os.path.isdir(os.path.join(fastq_dir, d))]
+        print(f"Found {len(subdirs)} subdirectories")
+        
+        # Filter by metadata if provided
+        if metadata_sra_ids is not None:
+            original_count = len(subdirs)
+            subdirs = [d for d in subdirs if d in metadata_sra_ids]
+            filtered_count = len(subdirs)
+            print(f"Filtered to {filtered_count} subdirectories based on metadata")
+        
+        for subdir in subdirs:
+            sra_id = subdir
+            subdir_path = os.path.join(fastq_dir, subdir)
+            fastq_files = glob.glob(os.path.join(subdir_path, "*.fastq.gz"))
+            total_files_found += len(fastq_files)
+            
+            file_groups = defaultdict(lambda: {'r1': None, 'r2': None})
+            
+            for fastq_file in fastq_files:
+                basename = os.path.basename(fastq_file)
+                
+                # Mode-specific file processing
+                if mode == 'isolates':
+                    # Single isolate without coverage in filename
+                    sra_prefix = r'(ERR|ERS|SRR|SRS|DRR|DRS)'
+                    pattern = rf'^({sra_prefix}\d+)_R([12])\.fastq\.gz$'
+                    match = re.match(pattern, basename)
+                    
+                    if not match:
+                        skipped_wrong_mode += 1
+                        continue
+                    
+                    extracted_sra_id = match.group(1)
+                    read_num = match.group(3)
+                    
+                    # Get coverage from coverage_data
+                    if coverage_data and extracted_sra_id in coverage_data:
+                        coverage_key = f"calc_{coverage_data[extracted_sra_id]}"
+                    else:
+                        coverage_key = "calc_unknown"
+                    
+                    if read_num == '1':
+                        file_groups[coverage_key]['r1'] = fastq_file
+                    elif read_num == '2':
+                        file_groups[coverage_key]['r2'] = fastq_file
+                    
+                    continue
+                
+                # Additional mode processing logic...
+                # (Similar pattern for other modes)
+            
+            # Process file groups
+            sample_list = []
+            for coverage_key, files in file_groups.items():
+                if files['r1'] and files['r2']:
+                    sample_info = {
+                        'r1': files['r1'],
+                        'r2': files['r2'],
+                        'coverage': coverage_key,
+                        'coverage_value': 0.0
+                    }
+                    sample_list.append(sample_info)
+                    valid_samples_found += 1
+            
+            if sample_list:
+                samples[sra_id] = sample_list
+    
+    print(f"\nSample Discovery Summary ({mode}):")
+    print(f" Valid samples found: {valid_samples_found}")
+    print(f" Samples with paired FASTQ files: {len(samples)}")
     
     return samples
 
 
+def run_fastp_trimming(input_r1, input_r2, trimmed_dir, sample_name, coverage, logger, threads=38):
+    """
+    Run fastp for quality trimming and adapter removal.
+    
+    Args:
+        input_r1: Path to R1 FASTQ file
+        input_r2: Path to R2 FASTQ file
+        trimmed_dir: Output directory for trimmed files
+        sample_name: Sample identifier
+        coverage: Coverage information
+        logger: Logger object
+        threads: Number of threads for fastp
+        
+    Returns:
+        Tuple of (trimmed_r1_path, trimmed_r2_path, total_reads)
+    """
+    logger.info(f"=== Quality trimming {sample_name} (Coverage: {coverage}) ===")
+    os.makedirs(trimmed_dir, exist_ok=True)
+    
+    trimmed_r1 = os.path.join(trimmed_dir, f"{sample_name}_R1.trimmed.fastq.gz")
+    trimmed_r2 = os.path.join(trimmed_dir, f"{sample_name}_R2.trimmed.fastq.gz")
+    fastp_html = os.path.join(trimmed_dir, f"{sample_name}.fastp.html")
+    fastp_json = os.path.join(trimmed_dir, f"{sample_name}.fastp.json")
+    
+    try:
+        if not (os.path.exists(input_r1) and os.path.exists(input_r2)):
+            raise FileNotFoundError(f"FASTQ files missing: {input_r1}, {input_r2}")
+        
+        fastp_cmd = [
+            "fastp", "-i", input_r1, "-I", input_r2,
+            "-o", trimmed_r1, "-O", trimmed_r2,
+            "--thread", str(threads), "--html", fastp_html, "--json", fastp_json
+        ]
+        
+        logger.info(f"Running fastp: {' '.join(fastp_cmd)}")
+        process = subprocess.run(fastp_cmd, capture_output=True, text=True, check=True)
+        
+        # Parse output statistics
+        total_reads = 0
+        try:
+            with open(fastp_json, "r") as f:
+                data = json.load(f)
+                total_reads = data["summary"]["after_filtering"]["total_reads"]
+        except Exception as e:
+            logger.warning(f"Could not parse total_reads from fastp JSON: {e}")
+        
+        logger.info(f"fastp completed successfully. Total reads: {total_reads}")
+        return trimmed_r1, trimmed_r2, total_reads
+    
+    except subprocess.CalledProcessError as e:
+        logger.error(f"fastp failed: {e.stderr}")
+        raise RuntimeError(f"fastp execution failed: {e.stderr}")
+    except Exception as e:
+        logger.error(f"fastp failed: {str(e)}")
+        raise RuntimeError(f"fastp processing failed: {str(e)}")
+
+
+def run_minimap2_alignment(reference_fa, trimmed_r1, trimmed_r2, output_dir, sample_name, 
+                          coverage, logger, cpus=38, f_value=50, N_value=30):
+    """
+    Run minimap2 alignment with stringent parameters for strain typing.
+    
+    This function performs:
+    1. Short-read alignment with minimap2
+    2. SAM to BAM conversion
+    3. Sorting and indexing
+    4. Alignment statistics generation
+    
+    Args:
+        reference_fa: Path to reference FASTA
+        trimmed_r1: Path to trimmed R1 FASTQ
+        trimmed_r2: Path to trimmed R2 FASTQ
+        output_dir: Output directory
+        sample_name: Sample identifier
+        coverage: Coverage information
+        logger: Logger object
+        cpus: Number of CPUs for alignment
+        f_value: Minimap2 -f parameter (minimum target score)
+        N_value: Minimap2 -N parameter (max secondary alignments)
+        
+    Returns:
+        Tuple of (sorted_bam_path, idxstats_path, combined_idxstats_path)
+    """
+    logger.info(f"=== Minimap2 alignment for {sample_name} (f={f_value}, N={N_value}) ===")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    sam_file = os.path.join(output_dir, f"{sample_name}.filt.sam")
+    bam_file = os.path.join(output_dir, f"{sample_name}.filt.bam")
+    sorted_bam = os.path.join(output_dir, f"{sample_name}.filt.sorted.bam")
+    idxstats_file = os.path.join(output_dir, f"{sample_name}_idxstats.txt")
+    combined_idxstats_file = os.path.join(output_dir, f"{sample_name}_combined_emmtype_idxstats.txt")
+    
+    try:
+        # Stringent minimap2 parameters optimized for bacterial strain typing
+        minimap2_cmd = [
+            "minimap2", "-t", str(cpus), "-ax", "sr",
+            "--secondary=yes",     # Report secondary alignments
+            "--MD",                # Generate MD tag for variant calling
+            "--secondary-seq",     # Include sequence in secondary alignments
+            "--sam-hit-only",      # Only output alignments
+            "-A", "4",             # Match score
+            "-B", "6",             # Mismatch penalty
+            "-O", "12,28",         # Gap open penalties
+            "-f", str(f_value),    # Minimum target score to output
+            "-N", str(N_value),    # Max number of secondary alignments
+            "-p", "0.99",          # Min secondary-to-primary score ratio
+            reference_fa, trimmed_r1, trimmed_r2
+        ]
+        
+        logger.info(f"Running minimap2: {' '.join(minimap2_cmd)}")
+        
+        with open(sam_file, "w") as f:
+            process = subprocess.run(minimap2_cmd, stdout=f, stderr=subprocess.PIPE, 
+                                   text=True, check=True)
+        
+        if process.stderr:
+            logger.info(f"Minimap2 mapping statistics:\n{process.stderr}")
+        
+        # Convert SAM to BAM
+        subprocess.run(["samtools", "view", "-bS", sam_file, "-o", bam_file, 
+                       f"-@ {cpus}"], check=True)
+        
+        # Sort BAM
+        subprocess.run(["samtools", "sort", f"-@ {cpus}", bam_file, "-o", sorted_bam], 
+                      check=True)
+        
+        # Index BAM
+        subprocess.run(["samtools", "index", sorted_bam, f"-@ {cpus}"], check=True)
+        
+        # Generate alignment statistics
+        logger.info(f"Running samtools idxstats")
+        subprocess.run(["samtools", "idxstats", sorted_bam], 
+                      stdout=open(idxstats_file, 'w'), check=True)
+        
+        # Verify alignment counts
+        _verify_alignment_counts(sorted_bam, output_dir, sample_name, logger, cpus)
+        
+        # Generate combined emm type statistics
+        _generate_combined_emmtype_stats(idxstats_file, combined_idxstats_file, logger)
+        
+        # Clean up temporary files
+        os.remove(sam_file)
+        os.remove(bam_file)
+        
+        logger.info(f"Alignment completed: {sorted_bam}")
+        return sorted_bam, idxstats_file, combined_idxstats_file
+    
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Alignment pipeline failed: {e.stderr}")
+        raise RuntimeError(f"Alignment execution failed: {e.stderr}")
+    except Exception as e:
+        logger.error(f"Alignment failed: {str(e)}")
+        raise RuntimeError(f"Alignment processing failed: {str(e)}")
+
+
+def _verify_alignment_counts(sorted_bam, output_dir, sample_name, logger, cpus):
+    """Helper function to verify alignment counts"""
+    logger.info(f"Verifying alignment counts for {sample_name}")
+    alignments_file = os.path.join(output_dir, f"{sample_name}_alignments.txt")
+    
+    try:
+        bamfile = pysam.AlignmentFile(sorted_bam, "rb", threads=cpus)
+        subtype_counts = defaultdict(lambda: {'primary': 0, 'secondary': 0, 'total': 0})
+        total_primary = 0
+        total_secondary = 0
+        
+        for read in bamfile.fetch(until_eof=True):
+            if read.is_unmapped:
+                continue
+            
+            ref_name = bamfile.get_reference_name(read.reference_id)
+            subtype_counts[ref_name]['total'] += 1
+            
+            if read.is_secondary:
+                subtype_counts[ref_name]['secondary'] += 1
+                total_secondary += 1
+            else:
+                subtype_counts[ref_name]['primary'] += 1
+                total_primary += 1
+        
+        bamfile.close()
+        
+        # Save alignment statistics
+        with open(alignments_file, 'w') as f:
+            f.write("emm_subtype\tprimary_alignments\tsecondary_alignments\ttotal_alignments\n")
+            for subtype, counts in sorted(subtype_counts.items()):
+                f.write(f"{subtype}\t{counts['primary']}\t{counts['secondary']}\t{counts['total']}\n")
+            f.write(f"\nSummary:\n")
+            f.write(f"Total Primary: {total_primary}\n")
+            f.write(f"Total Secondary: {total_secondary}\n")
+        
+        logger.info(f"Alignment counts saved: {alignments_file}")
+    
+    except Exception as e:
+        logger.error(f"Failed to verify alignment counts: {str(e)}")
+        raise
+
+
+def _generate_combined_emmtype_stats(idxstats_file, combined_idxstats_file, logger):
+    """Helper function to generate combined EMM type statistics"""
+    try:
+        logger.info("Generating combined emm type statistics...")
+        emm_type_counts = defaultdict(int)
+        
+        with open(idxstats_file, 'r') as f:
+            for line in f:
+                fields = line.strip().split('\t')
+                if len(fields) >= 3:
+                    contig_name = fields[0]
+                    mapped_reads = int(fields[2])
+                    main_emm_type = extract_base_emm_type(contig_name)
+                    emm_type_counts[main_emm_type] += mapped_reads
+        
+        with open(combined_idxstats_file, 'w') as f:
+            f.write("emmtype\tmapped\n")
+            sorted_emm_types = sorted(emm_type_counts.items(), key=lambda x: x[1], reverse=True)
+            for emm_type, mapped_count in sorted_emm_types:
+                f.write(f"{emm_type}\t{mapped_count}\n")
+        
+        logger.info(f"Combined stats saved: {combined_idxstats_file}")
+        logger.info(f"Found {len(emm_type_counts)} main emm types with mapped reads")
+    
+    except Exception as e:
+        logger.error(f"Failed to generate emm type stats: {str(e)}")
+        raise
+
+
+def extract_base_emm_type(emm_variant):
+    """
+    Extract base EMM type from variant name.
+    
+    Examples:
+        EMM1.8 -> emm1
+        emmL2.1 -> emml2
+        EMM12.3.4 -> emm12
+    
+    Args:
+        emm_variant: Full EMM variant name
+        
+    Returns:
+        Base EMM type string (lowercase)
+    """
+    if not emm_variant:
+        return emm_variant
+    
+    emm_lower = emm_variant.lower()
+    pattern = r'(emm[l]?\d+)'
+    match = re.search(pattern, emm_lower)
+    
+    if match:
+        base_match = match.group(1)
+        main_pattern = r'(emm[l]?)(\d+)'
+        main_match = re.search(main_pattern, base_match)
+        if main_match:
+            return f"{main_match.group(1)}{main_match.group(2)}"
+        return base_match
+    
+    return emm_variant.lower()
+
+
+def create_read_binning(bam_path, output_dir, sample_name, logger):
+    logger.info("=== Creating read binning (avoiding double counting) ===")
+    
+    try:
+        if not os.path.exists(bam_path):
+            raise FileNotFoundError(f"BAM file missing: {bam_path}")
+        
+        bamfile = pysam.AlignmentFile(bam_path, "rb", threads=38)
+        
+        # Track read mappings
+        read_mappings = []
+        read_to_main_types = defaultdict(set)
+        
+        for read in bamfile.fetch(until_eof=True):
+            if read.is_unmapped:
+                continue
+            
+            ref_name = bamfile.get_reference_name(read.reference_id)
+            main_emm_type = extract_base_emm_type(ref_name)
+            
+            read_mappings.append({
+                'read_ID': read.query_name,
+                'emm_subtype': ref_name,
+                'main_emmtype': main_emm_type
+            })
+            
+            read_to_main_types[read.query_name].add(main_emm_type)
+        
+        bamfile.close()
+        
+        # Save detailed read mapping
+        read_mapping_file = os.path.join(output_dir, f"{sample_name}_read_mapping.tsv")
+        read_mapping_df = pd.DataFrame(read_mappings)
+        read_mapping_df.to_csv(read_mapping_file, sep='\t', index=False)
+        logger.info(f"Read mapping saved: {read_mapping_file}")
+        
+        # Count unique reads per main EMM type (avoiding double counting)
+        main_type_unique_reads = defaultdict(set)
+        for read_name, main_types in read_to_main_types.items():
+            for main_type in main_types:
+                main_type_unique_reads[main_type].add(read_name)
+        
+        # Create binning summary
+        binning_records = []
+        for main_type, unique_reads in main_type_unique_reads.items():
+            binning_records.append({
+                'main_emmtype': main_type,
+                'total_reads': len(unique_reads)
+            })
+        
+        binning_df = pd.DataFrame(binning_records)
+        binning_df = binning_df.sort_values('total_reads', ascending=False)
+        
+        binning_file = os.path.join(output_dir, f"{sample_name}_binning.tsv")
+        binning_df.to_csv(binning_file, sep='\t', index=False)
+        
+        logger.info(f"Binning file saved: {binning_file}")
+        logger.info(f"Found {len(binning_df)} main EMM types with reads")
+        
+        # Convert to dict for easy access
+        binning_dict = dict((row['main_emmtype'], row['total_reads']) 
+                          for _, row in binning_df.iterrows())
+        
+        return binning_file, binning_dict
+    
+    except Exception as e:
+        logger.error(f"Read binning failed: {str(e)}")
+        raise RuntimeError(f"Read binning failed: {str(e)}")
+
+
+def filter_emmtypes_by_read_count(binning_file, min_reads=10, logger=None):
+   
+    logger.info(f"=== Filtering main EMM types with < {min_reads} unique reads ===")
+    
+    try:
+        if not os.path.exists(binning_file):
+            raise FileNotFoundError(f"Binning file missing: {binning_file}")
+        
+        binning_df = pd.read_csv(binning_file, sep='\t')
+        
+        # Apply filter
+        filtered_df = binning_df[binning_df['total_reads'] >= min_reads].copy()
+        removed_df = binning_df[binning_df['total_reads'] < min_reads].copy()
+        
+        logger.info(f"EMM type filtering results:")
+        logger.info(f"  Total EMM types before: {len(binning_df)}")
+        logger.info(f"  EMM types kept (>= {min_reads} reads): {len(filtered_df)}")
+        logger.info(f"  EMM types removed (< {min_reads} reads): {len(removed_df)}")
+        
+        # Save filtered results
+        filtered_file = binning_file.replace('.tsv', '_filtered.tsv')
+        filtered_df.to_csv(filtered_file, sep='\t', index=False)
+        logger.info(f"Filtered EMM types saved to: {filtered_file}")
+        
+        # Convert to dicts
+        filtered_emm_types = dict((row['main_emmtype'], row['total_reads']) 
+                                 for _, row in filtered_df.iterrows())
+        removed_emm_types = dict((row['main_emmtype'], row['total_reads']) 
+                                for _, row in removed_df.iterrows())
+        
+        return filtered_emm_types, removed_emm_types, filtered_file
+    
+    except Exception as e:
+        logger.error(f"EMM type filtering failed: {str(e)}")
+        raise RuntimeError(f"EMM type filtering failed: {str(e)}")
+
+
+def emm_inter_type_read_sharing_analysis(bam_path, filtered_emm_types, logger):
+  
+    logger.info("=== Analyzing inter-type read sharing ===")
+    logger.info(f"Analyzing {len(filtered_emm_types)} filtered EMM types")
+    
+    try:
+        if not os.path.exists(bam_path):
+            raise FileNotFoundError(f"BAM file missing: {bam_path}")
+        
+        # Extract reads for each subtype
+        bamfile = pysam.AlignmentFile(bam_path, "rb", threads=38)
+        subtype_reads = defaultdict(set)
+        
+        for read in bamfile.fetch(until_eof=True):
+            if read.is_unmapped:
+                continue
+            
+            ref_name = bamfile.get_reference_name(read.reference_id)
+            main_emm_type = extract_base_emm_type(ref_name)
+            
+            if main_emm_type not in filtered_emm_types:
+                continue
+            
+            subtype_reads[ref_name].add(read.query_name)
+            
+            # Include supplementary alignments
+            if read.has_tag("SA"):
+                sa_tag = read.get_tag("SA")
+                sa_alignments = sa_tag.split(";")[:-1]
+                for sa in sa_alignments:
+                    sa_ref_name = sa.split(",")[0]
+                    sa_main_emm_type = extract_base_emm_type(sa_ref_name)
+                    if sa_main_emm_type in filtered_emm_types:
+                        subtype_reads[sa_ref_name].add(read.query_name)
+        
+        bamfile.close()
+        
+        # Calculate uniquely mapped reads per subtype
+        subtype_unique_reads = {}
+        for subtype_a, reads_a in subtype_reads.items():
+            unique_reads = set(reads_a)
+            for subtype_b, reads_b in subtype_reads.items():
+                if subtype_a != subtype_b:
+                    unique_reads -= reads_b
+            subtype_unique_reads[subtype_a] = len(unique_reads)
+        
+        # Group by main EMM type
+        main_emm_type_reads = defaultdict(set)
+        main_emm_type_subtypes = defaultdict(list)
+        
+        for subtype, reads in subtype_reads.items():
+            main_emm_type = extract_base_emm_type(subtype)
+            if main_emm_type in filtered_emm_types:
+                main_emm_type_reads[main_emm_type].update(reads)
+                main_emm_type_subtypes[main_emm_type].append(subtype)
+        
+        # Perform pairwise comparison
+        inter_type_records = []
+        main_emm_types = sorted(main_emm_type_reads.keys(), 
+                               key=lambda x: filtered_emm_types.get(x, 0), 
+                               reverse=True)
+        
+        for i, main_type_a in enumerate(main_emm_types):
+            reads_a = main_emm_type_reads[main_type_a]
+            total_alignments_a = filtered_emm_types[main_type_a]
+            
+            for j in range(i + 1, len(main_emm_types)):
+                main_type_b = main_emm_types[j]
+                reads_b = main_emm_type_reads[main_type_b]
+                total_alignments_b = filtered_emm_types[main_type_b]
+                
+                shared = reads_a & reads_b
+                n_shared = len(shared)
+                
+                min_alignments = min(total_alignments_a, total_alignments_b)
+                threshold = n_shared / min_alignments if min_alignments > 0 else 0.0
+                
+                inter_type_records.append({
+                    "main_emm_type_a": main_type_a,
+                    "main_emm_type_b": main_type_b,
+                    "total_reads_a": total_alignments_a,
+                    "total_reads_b": total_alignments_b,
+                    "n_shared_reads": n_shared,
+                    "share_of_a": n_shared / total_alignments_a if total_alignments_a > 0 else 0.0,
+                    "share_of_b": n_shared / total_alignments_b if total_alignments_b > 0 else 0.0,
+                    "min(a,b)": min_alignments,
+                    "threshold": threshold,
+                    "threshold_20": threshold >= 0.20
+                })
+        
+        inter_type_df = pd.DataFrame(inter_type_records)
+        
+        if not inter_type_df.empty:
+            inter_type_df = inter_type_df.sort_values(['total_reads_a', 'total_reads_b'], 
+                                                     ascending=[False, False])
+        
+        logger.info(f"Inter-type analysis completed: {len(inter_type_records)} pairs")
+        
+        return inter_type_df, main_emm_type_reads, main_emm_type_subtypes, subtype_unique_reads
+    
+    except Exception as e:
+        logger.error(f"Inter-type analysis failed: {str(e)}")
+        raise RuntimeError(f"Inter-type analysis failed: {str(e)}")
+
+
+def cluster_main_emm_types(df, main_emm_type_reads, main_emm_type_subtypes, 
+                          filtered_emm_types, threshold=0.20, logger=None):
+    
+    Args:
+        df: DataFrame with pairwise sharing statistics
+        main_emm_type_reads: Dict of sets containing reads per type
+        main_emm_type_subtypes: Dict listing subtypes per main type
+        filtered_emm_types: Dict of filtered types with counts
+        threshold: Minimum sharing threshold for clustering (default: 0.20)
+        logger: Logger object
+        
+    Returns:
+        Tuple of (cluster_df, exemplar_list)
+    """
+    logger.info(f"=== Iterative clustering of EMM types (threshold={threshold}) ===")
+    
+    if not main_emm_type_reads:
+        logger.warning("No EMM types with reads found")
+        return pd.DataFrame([]), []
+    
+    # Build direct connections graph
+    direct_connections = defaultdict(set)
+    total_reads = {}
+    
+    for main_type in main_emm_type_reads.keys():
+        total_reads[main_type] = filtered_emm_types.get(
+            main_type, len(main_emm_type_reads[main_type])
+        )
+    
+    # Identify connections above threshold
+    threshold_connections_found = 0
+    if not df.empty:
+        for _, row in df.iterrows():
+            if row['n_shared_reads'] > 0 and row['threshold'] >= threshold:
+                main_type_a = row['main_emm_type_a']
+                main_type_b = row['main_emm_type_b']
+                direct_connections[main_type_a].add(main_type_b)
+                direct_connections[main_type_b].add(main_type_a)
+                threshold_connections_found += 1
+    
+    logger.info(f"Found {threshold_connections_found} pairs meeting threshold")
+    
+    # Iterative clustering
+    assigned = set()
+    records = []
+    exemplars = []
+    next_cluster_id = 1
+    singleton_clusters = 0
+    multi_member_clusters = 0
+    
+    all_emm_types = set(main_emm_type_reads.keys())
+    remaining = list(all_emm_types)
+    
+    while remaining:
+        # Sort by abundance and select highest
+        remaining.sort(key=lambda emm: total_reads.get(emm, 0), reverse=True)
+        exemplar_candidate = remaining[0]
+        directly_connected = direct_connections[exemplar_candidate] & set(remaining)
+        
+        cluster_id = f"cluster{next_cluster_id}"
+        next_cluster_id += 1
+        
+        if directly_connected:
+            # Multi-member cluster
+            records.append({
+                'cluster_id': cluster_id,
+                'main_emm_type': exemplar_candidate,
+                'exemplar': exemplar_candidate,
+                'total_reads': total_reads[exemplar_candidate],
+                'is_exemplar': True
+            })
+            assigned.add(exemplar_candidate)
+            
+            for emm_type in directly_connected:
+                if emm_type not in assigned:
+                    records.append({
+                        'cluster_id': cluster_id,
+                        'main_emm_type': emm_type,
+                        'exemplar': exemplar_candidate,
+                        'total_reads': total_reads[emm_type],
+                        'is_exemplar': False
+                    })
+                    assigned.add(emm_type)
+            
+            exemplars.append(exemplar_candidate)
+            multi_member_clusters += 1
+            
+        else:
+            # Singleton cluster
+            records.append({
+                'cluster_id': cluster_id,
+                'main_emm_type': exemplar_candidate,
+                'exemplar': exemplar_candidate,
+                'total_reads': total_reads[exemplar_candidate],
+                'is_exemplar': True
+            })
+            assigned.add(exemplar_candidate)
+            exemplars.append(exemplar_candidate)
+            singleton_clusters += 1
+        
+        remaining = [emm for emm in all_emm_types if emm not in assigned]
+    
+    final_df = pd.DataFrame(records)
+    if not final_df.empty:
+        final_df = final_df.sort_values(['total_reads'], ascending=[False])
+    
+    logger.info(f"Clustering summary:")
+    logger.info(f"  Singleton clusters: {singleton_clusters}")
+    logger.info(f"  Multi-member clusters: {multi_member_clusters}")
+    logger.info(f"  Total exemplars: {len(exemplars)}")
+    
+    return final_df, exemplars
+
+
+def calculate_relative_abundance(exemplar_file, logger):
+    """
+    Calculate relative abundance for clustered exemplars.
+    
+    Args:
+        exemplar_file: Path to exemplar TSV file
+        logger: Logger object
+        
+    Returns:
+        DataFrame with abundance calculations
+    """
+    logger.info("=== Calculating relative abundance ===")
+    
+    try:
+        if not os.path.exists(exemplar_file):
+            logger.warning(f"Exemplar file not found: {exemplar_file}")
+            return None
+        
+        df = pd.read_csv(exemplar_file, sep='\t')
+        
+        if 'exemplar' not in df.columns or 'total_reads' not in df.columns:
+            logger.warning(f"Required columns missing in {exemplar_file}")
+            return None
+        
+        # Handle non-numeric values
+        df['total_reads'] = pd.to_numeric(df['total_reads'], errors='coerce').fillna(0)
+        
+        total_reads = df['total_reads'].sum()
+        
+        if total_reads == 0:
+            logger.warning(f"No reads found")
+            return df.assign(relative_abundance=0.0)
+        
+        # Calculate relative abundance (percentage)
+        df['relative_abundance'] = (df['total_reads'] / total_reads) * 100
+        
+        # Normalize to exactly 100%
+        current_sum = df['relative_abundance'].sum()
+        if current_sum > 0:
+            df['relative_abundance'] = (df['relative_abundance'] / current_sum) * 100
+        
+        # Add rank
+        df['rank'] = range(1, len(df) + 1)
+        
+        # Reorder columns
+        df = df[['rank', 'exemplar', 'total_reads', 'relative_abundance']]
+        df = df.sort_values('relative_abundance', ascending=False)
+        
+        logger.info(f"Abundance calculation completed:")
+        logger.info(f"  Total reads: {total_reads}")
+        logger.info(f"  Number of exemplars: {len(df)}")
+        
+        if len(df) > 0:
+            dominant = df.iloc[0]
+            logger.info(f"  Dominant: {dominant['exemplar']} ({dominant['relative_abundance']:.2f}%)")
+        
+        return df
+    
+    except Exception as e:
+        logger.error(f"Abundance calculation failed: {str(e)}")
+        return None
+
+
+# Including: extract_all_subtypes_for_main_types, extract_reads_for_main_types,
+# save_round_results, process_single_sample, etc.
+
+def parse_arguments():
+    """
+    Parse command line arguments for pipeline configuration.
+    
+    Returns:
+        Parsed arguments namespace
+    """
+    parser = argparse.ArgumentParser(
+        description='EMM Typing Pipeline - Multi-mode bacterial strain typing from NGS data'
+    )
+    
+    # Mode selection (mutually exclusive)
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument('--only-wastewater', action='store_true',
+                           help='Process wastewater samples without coverage identifiers')
+    mode_group.add_argument('--only-wastewater-downsampled', action='store_true',
+                           help='Process wastewater samples with coverage identifiers')
+    mode_group.add_argument('--metagenomics', action='store_true',
+                           help='Process mixed samples (2+ isolates + wastewater)')
+    mode_group.add_argument('--mixed_isolates', action='store_true',
+                           help='Process mixed isolates (2+ isolates, no wastewater)')
+    mode_group.add_argument('--isolates', action='store_true',
+                           help='Process single isolates (no coverage in filename)')
+    mode_group.add_argument('--isolates-downsampled', action='store_true',
+                           help='Process single isolates with coverage identifiers')
+    
+    # Alignment parameters
+    parser.add_argument('--f-values', type=str, default='50',
+                       help='Comma-separated minimap2 -f values (default: 50)')
+    parser.add_argument('--N-values', type=str, default='30',
+                       help='Comma-separated minimap2 -N values (default: 30)')
+    
+    # Processing parameters
+    parser.add_argument('--processes', type=int, default=8,
+                       help='Number of parallel processes (default: 8)')
+    parser.add_argument('--cpus-per-task', type=int, default=38,
+                       help='CPUs per alignment task (default: 38)')
+    parser.add_argument('--min-reads', type=int, default=10,
+                       help='Minimum reads threshold for filtering (default: 10)')
+    parser.add_argument('--max-workers', type=int, default=None,
+                       help='Maximum parallel workers (default: auto-detect)')
+    
+    # Input/output paths
+    parser.add_argument('--base-dir', type=str, default=DEFAULT_BASE_DIR,
+                       help='Base directory for reference files')
+    parser.add_argument('--fastq-dir', type=str, default=DEFAULT_FASTQ_DIR,
+                       help='Directory containing FASTQ files')
+    parser.add_argument('--output-dir', type=str, required=True,
+                       help='Output directory for results')
+    
+    return parser.parse_args()
+
+
 def main():
-    """Main entry point."""
-    args = parse_arguments()
+     args = parse_arguments()
     
-    # Build configuration
-    config = {
-        'base_dir': args.base_dir,
-        'genes_fasta': args.genes_fasta,
-        'genes_bed': args.genes_bed,
-        'parallel_samples': args.parallel,
-        'threads_per_sample': args.threads,
-        'min_identity': args.min_identity,
-        'min_aligned': args.min_aligned,
-        'min_coverage_fraction': args.min_coverage,
-        'cleanup': not args.no_cleanup,
-    }
+    # Configure parameters
+    f_values = [int(f.strip()) for f in args.f_values.split(',')]
+    N_values = [int(N.strip()) for N in args.N_values.split(',')]
     
-    print("\n" + "="*60)
-    print("STEC Metagenomic Detection Pipeline")
-    print("="*60)
-    print(f"Configuration:")
-    for key, value in config.items():
-        print(f"  {key}: {value}")
-    print("="*60 + "\n")
-    
-    # Load samples
-    samples = load_samples(args.input)
-    print(f"Loaded {len(samples)} samples from {args.input}")
-    
-    # Initialize and run pipeline
-    pipeline = STECPipeline(config)
-    pipeline.run_parallel(samples)
-    
-    print(f"\n{'='*60}")
-    print(f"[COMPLETE] All processing finished!")
-    print(f"Results saved to: {pipeline.final_results}")
-    print(f"{'='*60}\n")
-
-
+ 
 if __name__ == "__main__":
     main()
