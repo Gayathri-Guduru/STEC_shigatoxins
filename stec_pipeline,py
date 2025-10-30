@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 EMM Typing Pipeline for Streptococcus pyogenes
-A three-round iterative alignment and clustering pipeline for bacterial strain typing
+A three-round iterative alignment and clustering pipeline for Sequence typing
 from metagenomic and isolate sequencing data.
 """
 
